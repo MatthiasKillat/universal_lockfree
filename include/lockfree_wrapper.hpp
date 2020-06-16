@@ -35,7 +35,7 @@ private:
         {
         }
 
-        std::atomic<T *> ptr{nullptr}; //the payload we want to protect
+        std::atomic<T *> ptr{nullptr}; //the payload we want to protect todo: can be mase nonatomic in conjunctio with atomic status?
         HazardPointer *next{nullptr};
         std::atomic<uint32_t> status{FREE};
         const uint64_t id; //unique and does not change (can use the this pointer instead later)
@@ -141,7 +141,7 @@ public:
 
         //major todo: we run into double frees here somehow
         //should probably block acquisition here as well
-        //releaseHazardPointer(*currentObjectHazardPointer); //triggers a scan and since all were RELEASED all get freed
+        releaseHazardPointer(*currentObjectHazardPointer); //triggers a scan and since all were RELEASED all get freed
 
         hp = hazardPointers.load();
         while (hp)
@@ -363,7 +363,6 @@ private:
 
         std::set<T *> deleteSet;
 
-        //major todo: error in deletion leads to double frees
         for (auto hp : deleteCandidates)
         {
             if (hp->status.load() == DELETABLE)
@@ -373,11 +372,37 @@ private:
             }
         }
 
+        //can this be for pointers that switched to RELEASED?!
+        //todo: terribly inefficient (at least quadratic), not necessary... rework whole algorithm
+        // auto hp = hazardPointers.load();
+        // while (hp)
+        // {
+        //     auto p = hp->ptr.load();
+        //     if (deleteSet.find(p) != deleteSet.end())
+        //     {
+        //         hp->status.store(FREE);
+        //     }
+        //     hp = hp->next;
+        // }
+
         //note that when in the meantime other hazardpointers are released, we might not free all resources we could
         //(they will be freed in the next scan)
         //also note that we never free something that is in use (and have no double free)
         for (auto p : deleteSet)
         {
+
+            //just to understand the cause of the free bug
+            auto hp = hazardPointers.load();
+            while (hp)
+            {
+                if (p == hp->ptr.load())
+                {
+                    hp->ptr.store(nullptr); //should not be necessary...
+                    hp->status.store(FREE);
+                }
+                hp = hp->next;
+            }
+
             free(p);
         }
 
