@@ -14,7 +14,6 @@
 //todo: memory order
 //todo: interface, proxy design, copy/move
 //todo: optimization
-//todo: deletion race can result in leak?
 
 //todo: transaction proxy (similar to writer, but with explicit writeback)
 
@@ -36,8 +35,7 @@ private:
         {
         }
 
-        std::atomic<T *> ptr{nullptr}; //the payload, todo: could use type T* to avoid casts, atomic needed? (who chanegs this?)
-
+        std::atomic<T *> ptr{nullptr}; //the payload we want to protect
         HazardPointer *next{nullptr};
         std::atomic<uint32_t> status{FREE};
         const uint64_t id; //unique and does not change (can use the this pointer instead later)
@@ -69,8 +67,6 @@ public:
         ReadOnlyProxy(LockFree<S> &wrapper) : wrapper(&wrapper)
         {
             hp = this->wrapper->acquireHazardPointer(); //todo: deal with failure (hard to do, we need the raw pointer in operator->)
-
-            //std::cout << "reader hp " << hp << std::endl;
             object = this->wrapper->ptr(*hp);
         }
 
@@ -88,7 +84,6 @@ public:
             if (!wrapper->updateObject(object, copy))
             {
                 wrapper->free(copy);
-                //std::cout << "TryWriteProxy deleted unused copy " << copy << std::endl;
             }
 
             wrapper->releaseHazardPointer(*hp);
@@ -110,7 +105,6 @@ public:
             hp = this->wrapper->acquireHazardPointer(); //todo: deal with failure
             object = this->wrapper->ptr(*hp);
             copy = this->wrapper->allocate(*object);
-            //std::cout << "TryWriteProxy created copy " << copy << std::endl;
         }
 
         //TryWriteProxy(const TryWriteProxy &) = default;
@@ -121,11 +115,10 @@ public:
     friend class ReadOnlyProxy<T>;
     friend class TryWriteProxy<T>;
 
-    //todo: more construction variants, emplacement, move etc.
-    LockFree(const T &value) : currentObjectHazardPointer(new HazardPointer(numHazardPointers.fetch_add(1)))
+    template <typename... Args>
+    LockFree(Args &&... args) : currentObjectHazardPointer(createHazardPointer())
     {
-        auto initialObject = allocate(value);
-        //std::cout << "created initial object " << initialObject << std::endl;
+        auto initialObject = allocate(std::forward<Args>(args)...);
         currentObjectHazardPointer->ptr.store(initialObject); //owned internally, only released in dtor, prevents deletion of current object
         currentObjectHazardPointer->status.store(USED);
         hazardPointers = currentObjectHazardPointer;
@@ -133,11 +126,9 @@ public:
 
     ~LockFree()
     {
-        //std::cout << "Dtor" << std::endl;
-
-        auto finalObject = currentObject();
-
-        //todo: technically we must block the generation of new hazards here ...
+        //should maybe also block acquisition (recycling existing ones) but this is bad since we would need to check it always
+        // (acquisition will happen much more often compared to creation)
+        canCreateHazardPointer.store(false, std::memory_order_release);
 
         auto hp = hazardPointers.load();
 
@@ -230,8 +221,6 @@ public:
             T *expected = ptr(hp);
             T *copy = allocate(*expected); //local copy, protected against deletion by hp
 
-            //std::cout << "created copy " << copy << std::endl;
-
             auto result = std::invoke(f, copy, std::forward<Params>(params)...);
 
             if (updateObject(expected, copy))
@@ -242,7 +231,6 @@ public:
 
             //our update failed, the copy is useless now
             free(copy); //could optimize and use in place construction in memory instead
-            //std::cout << "deleted unused copy " << copy << std::endl;
 
             //we recycle the hazard pointer and load the new object state (can optimize by using load of compare exchange)
             hp.ptr.store(currentObject());
@@ -251,6 +239,7 @@ public:
     }
 
 private:
+    std::atomic_bool canCreateHazardPointer{true};
     HazardPointer *currentObjectHazardPointer;
 
     //for now, only one deleteScan shall be active at a time
@@ -289,7 +278,7 @@ private:
         }
 
         //no free hazard pointer, create a new one
-        hp = new HazardPointer(numHazardPointers.fetch_add(1));
+        hp = createHazardPointer();
         hp->status.store(USED);
 
         auto head = hazardPointers.load();
@@ -358,23 +347,7 @@ private:
             }
         }
 
-        //std::cout << "Delete Scan " << std::endl;
-        // std::cout << "used pointers ";
-        // for (auto used : usedPointers)
-        // {
-        //     std::cout << used << " ";
-        // }
-        // std::cout << std::endl;
-
-        // std::cout << "delete candidates ";
-        // for (auto hp : deleteCandidates)
-        // {
-        //     std::cout << hp->ptr.load() << " ";
-        // }
-        // std::cout << std::endl;
-
         //now check if we really can delete the candidates(i.e.no USED hazardpointer with the same ptr exists)
-
         for (auto hp : deleteCandidates)
         {
             auto ptr = hp->ptr.load();
@@ -416,5 +389,15 @@ private:
     void free(T *p)
     {
         Allocator::free(p);
+    }
+
+    HazardPointer *createHazardPointer()
+    {
+        if (canCreateHazardPointer.load())
+        {
+            //can use a pool later
+            return new HazardPointer(numHazardPointers.fetch_add(1));
+        }
+        return nullptr;
     }
 };
