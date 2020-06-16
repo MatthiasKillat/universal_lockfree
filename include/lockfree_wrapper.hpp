@@ -126,6 +126,7 @@ public:
 
     ~LockFree()
     {
+        std::cout << "Destructor" << std::endl;
         //should maybe also block acquisition (recycling existing ones) but this is bad since we would need to check it always
         // (acquisition will happen much more often compared to creation)
         canCreateHazardPointer.store(false, std::memory_order_release);
@@ -138,7 +139,9 @@ public:
             hp = hp->next;
         }
 
-        releaseHazardPointer(*currentObjectHazardPointer); //triggers a scan and since all were RELEASED
+        //major todo: we run into double frees here somehow
+        //should probably block acquisition here as well
+        //releaseHazardPointer(*currentObjectHazardPointer); //triggers a scan and since all were RELEASED all get freed
 
         hp = hazardPointers.load();
         while (hp)
@@ -211,6 +214,7 @@ public:
     {
     }
 
+    //todo: variant without return value, does not need to compute result internally
     template <typename Function, typename... Params>
     decltype(auto) invoke(Function &&f, Params &&... params)
     {
@@ -359,6 +363,7 @@ private:
 
         std::set<T *> deleteSet;
 
+        //major todo: error in deletion leads to double frees
         for (auto hp : deleteCandidates)
         {
             if (hp->status.load() == DELETABLE)

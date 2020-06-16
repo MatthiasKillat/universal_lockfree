@@ -1,5 +1,4 @@
 #include <iostream>
-#include <thread>
 #include <chrono>
 
 #include "lockfree_wrapper.hpp"
@@ -66,7 +65,7 @@ int main(int argc, char **argv)
     }
 
     //check if there are undeleted objects
-    Allocator::printAllocations();
+    Allocator::print();
 #endif
     return 0;
 }
