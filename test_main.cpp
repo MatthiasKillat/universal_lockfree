@@ -84,7 +84,7 @@ int main(int argc, char **argv)
         lfBar->print();
     }
 
-    std::cout << "free errors " << Allocator::errors() << std::endl;
+    //todo: there still is a race /missing deletion as the MonitoredAllocator shows
     Allocator::print();
     return 0;
 }

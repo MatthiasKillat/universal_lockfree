@@ -14,7 +14,6 @@
 //todo: memory order
 //todo: interface, proxy design, copy/move
 //todo: optimization
-
 //todo: transaction proxy (similar to writer, but with explicit writeback)
 
 template <typename T>
@@ -268,23 +267,32 @@ private:
     //get a free hazard pointer or create a new one
     HazardPointer *acquireHazardPointer()
     {
-        HazardPointer *hp = hazardPointers.load();
 
-        //try to recycle a free hazard pointer
-        while (hp)
+        //we spin until a free one becomes available if creation is impossible
+        //later we could control the number available hazardpointers like this
+        //and hence the number of maximally needed copies
+
+        constexpr bool hazardPointerCreationIsImpossible = false;
+
+        do
         {
-            uint32_t expectedStatus = FREE;
-            if (hp->status.compare_exchange_strong(expectedStatus, USED))
+            HazardPointer *hp = hazardPointers.load();
+            //try to recycle a free hazard pointer
+            while (hp)
             {
-                hp->ptr = currentObject();
-                numUsedHazardPointers.fetch_add(1);
-                return hp;
+                uint32_t expectedStatus = FREE;
+                if (hp->status.compare_exchange_strong(expectedStatus, USED))
+                {
+                    hp->ptr = currentObject();
+                    numUsedHazardPointers.fetch_add(1);
+                    return hp;
+                }
+                hp = hp->next;
             }
-            hp = hp->next;
-        }
+        } while (hazardPointerCreationIsImpossible);
 
         //no free hazard pointer, create a new one
-        hp = createHazardPointer();
+        auto hp = createHazardPointer();
         hp->status.store(USED);
 
         auto head = hazardPointers.load();
@@ -331,6 +339,8 @@ private:
 
         //todo: we are lockfree, but the problem is: if the scanning thread dies, no one can ever scan again
         //and we leak memory (and probably fast) sinc eno hazard pointer will be freed
+        //however, to scans in parallel will interfere in a bad way: potentially trying to delete the same pointers
+        //so this must be prevented
         //major todo/question: can we do it in a robust lockfree way (without the scanInProgress flag)
 
         std::set<HazardPointer *> deleteCandidates;
