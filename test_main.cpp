@@ -3,27 +3,31 @@
 #include <chrono>
 
 #include "lockfree_wrapper.hpp"
-#include "foo.hpp"
 #include "allocator.hpp"
+#include "bar.hpp"
 
 template <typename TestObject>
 void work(TestObject &object, int a = 1, int iterations = 1000000)
 {
     for (int i = 0; i < iterations; ++i)
     {
-        object.inc(a);
+        object.work(a);
     }
 }
 
 template <typename TestObject>
-void test(TestObject &object, int iterations = 1000000, int n = 2)
+void test(TestObject &object, int iterations = 1000000, int n = 2, int m = 2)
 {
     std::vector<std::thread> threads;
-    threads.reserve(2 * n);
+    threads.reserve(n + m);
 
     for (int i = 0; i < n; ++i)
     {
         threads.emplace_back(work<TestObject>, std::ref(object), 1, iterations);
+    }
+
+    for (int i = 0; i < m; ++i)
+    {
         threads.emplace_back(work<TestObject>, std::ref(object), -1, iterations);
     }
 
@@ -38,19 +42,23 @@ void workLockfree(TestObject &object, int a = 1, int iterations = 1000000)
 {
     for (int i = 0; i < iterations; ++i)
     {
-        object.invoke(&Bar::inc, a);
+        object.invoke(&Bar::work, a);
     }
 }
 
 template <typename TestObject>
-void testLockfree(TestObject &object, int iterations = 1000000, int n = 2)
+void testLockfree(TestObject &object, int iterations = 1000000, int n = 2, int m = 2)
 {
     std::vector<std::thread> threads;
-    threads.reserve(2 * n);
+    threads.reserve(n + m);
 
     for (int i = 0; i < n; ++i)
     {
         threads.emplace_back(workLockfree<TestObject>, std::ref(object), 1, iterations);
+    }
+
+    for (int i = 0; i < m; ++i)
+    {
         threads.emplace_back(workLockfree<TestObject>, std::ref(object), -1, iterations);
     }
 
@@ -60,19 +68,18 @@ void testLockfree(TestObject &object, int iterations = 1000000, int n = 2)
     }
 }
 
-//todo: better test to see lockfree property
 int main(int argc, char **argv)
 {
     {
         Bar bar;
-        test(bar, 1 << 20, 4);
+        test(bar, 1 << 20, 2, 3);
         std::cout << "Bar" << std::endl;
         bar.print();
     }
 
     {
         LockFree<Bar> lfBar;
-        testLockfree(lfBar, 10000, 1);
+        testLockfree(lfBar, 1000, 2, 3);
         std::cout << "Lockfree Bar" << std::endl;
         lfBar->print();
     }
