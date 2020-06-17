@@ -25,8 +25,7 @@ private:
     {
         FREE,
         USED,
-        RELEASED,
-        DELETABLE
+        RELEASED
     };
 
     struct HazardPointer
@@ -135,7 +134,10 @@ public:
 
         while (hp)
         {
-            hp->status.store(RELEASED); //if there are active users this will cause problems (release their resource)
+            if (hp->status.load() == USED)
+            {
+                hp->status.store(RELEASED); //if there are active users this will cause problems (release their resource)
+            }
             hp = hp->next;
         }
 
@@ -179,15 +181,12 @@ public:
 
     bool updateObject(T *expectedObject, T *newObject)
     {
-        auto hp = acquireHazardPointer(); //to protect the current object and be able to delete it later
         //we cannot have an ABA problem here, ptr will be deleted and possibly recycled only after no one holds ptr anymore
         //in a hazardpointer (and therefore will not try to update with this old value)
         if (currentObjectHazardPointer->ptr.compare_exchange_strong(expectedObject, newObject))
         {
-            releaseHazardPointer(*hp);
             return true;
         }
-        releaseHazardPointer(*hp);
         return false;
     }
 
@@ -255,7 +254,9 @@ private:
     //this is also not the best structure to search in, there is potential for optimization
     //but it shows the general idea
 
-    std::atomic<uint64_t> numHazardPointers{0};           //i.e. list size
+    std::atomic<uint64_t> numHazardPointers{0}; //i.e. list size
+    std::atomic<uint64_t> numUsedHazardPointers{1};
+    std::atomic<uint64_t> numReleasedHazardPointers{0};
     std::atomic<HazardPointer *> hazardPointers{nullptr}; //managed hazard pointers, can be used to protect objects
 
     //todo: uneeded, remove later
@@ -276,6 +277,7 @@ private:
             if (hp->status.compare_exchange_strong(expectedStatus, USED))
             {
                 hp->ptr = currentObject();
+                numUsedHazardPointers.fetch_add(1);
                 return hp;
             }
             hp = hp->next;
@@ -297,6 +299,7 @@ private:
 
         } while (true);
 
+        numUsedHazardPointers.fetch_add(1);
         return hp;
     }
 
@@ -305,12 +308,20 @@ private:
     {
         //we are the only writer to this hazard pointer (hence no compare exchange needed)
         hp.status.store(RELEASED);
-        deleteScan();
+        auto numReleased = numReleasedHazardPointers.fetch_add(1);
+        auto numUsed = numUsedHazardPointers.fetch_sub(1);
+
+        constexpr double deleteScanFactor = 0.25;
+        if (numUsed * deleteScanFactor <= numReleased)
+        {
+            //when enough were released (relative to those used) we atomically reset the released counter and trigger a scan
+            do
+            {
+            } while (!numReleasedHazardPointers.compare_exchange_weak(numReleased, 0));
+            deleteScan();
+        }
     }
 
-    //we need to scan all hazardpointers for possible deletions, we cannot just free the released one due to races (which would lead to duble frees or leaks)
-    //this is essentially a case of "helping" other operations to progress
-    //todo: this algorithm can be optimized (more efficient/elegant/simpler)
     bool deleteScan()
     {
         if (scanInProgress.test_and_set(std::memory_order_acq_rel))
@@ -321,8 +332,6 @@ private:
         //todo: we are lockfree, but the problem is: if the scanning thread dies, no one can ever scan again
         //and we leak memory (and probably fast) sinc eno hazard pointer will be freed
         //major todo/question: can we do it in a robust lockfree way (without the scanInProgress flag)
-        auto head = hazardPointers.load();
-        auto n = numHazardPointers.load();
 
         std::set<HazardPointer *> deleteCandidates;
         std::set<T *> usedPointers;
@@ -330,18 +339,14 @@ private:
         {
             //we can iterate over the hazard pointer list without problems (there may be added new ones in front,
             //but they are just not considered for deletion and at least as new as currentObject
-            auto hp = head;
+            auto hp = hazardPointers.load();
             while (hp)
             {
                 auto status = hp->status.load();
                 if (status == RELEASED)
                 {
-                    hp->status.store(DELETABLE); //optimistic assumption: can delete later
+                    //hp->status.store(DELETABLE); //optimistic assumption: can delete later
                     deleteCandidates.insert(hp);
-                }
-                else if (status == DELETABLE)
-                {
-                    deleteCandidates.insert(hp); //should not happen, optimize the algorithm
                 }
                 else if (status == USED) //note that it does not matter if the status became RELEASED inbetween (we just cannot free it in this scan)
                 {
@@ -351,58 +356,21 @@ private:
             }
         }
 
+        std::set<T *> deleteSet;
+
         //now check if we really can delete the candidates(i.e.no USED hazardpointer with the same ptr exists)
         for (auto hp : deleteCandidates)
         {
             auto ptr = hp->ptr.load();
-            if (usedPointers.find(ptr) != usedPointers.end())
+            if (usedPointers.find(ptr) == usedPointers.end())
             {
-                hp->status.store(RELEASED); //assumption was wrong: NOT deletable
-            }
-        }
-
-        std::set<T *> deleteSet;
-
-        for (auto hp : deleteCandidates)
-        {
-            if (hp->status.load() == DELETABLE)
-            {
+                deleteSet.insert(hp->ptr.load()); //avoid duplicates
                 hp->status.store(FREE);
-                deleteSet.insert(hp->ptr.load()); //avoid duplicates, can be done with unique as well
             }
         }
 
-        //can this be for pointers that switched to RELEASED?!
-        //todo: terribly inefficient (at least quadratic), not necessary... rework whole algorithm
-        // auto hp = hazardPointers.load();
-        // while (hp)
-        // {
-        //     auto p = hp->ptr.load();
-        //     if (deleteSet.find(p) != deleteSet.end())
-        //     {
-        //         hp->status.store(FREE);
-        //     }
-        //     hp = hp->next;
-        // }
-
-        //note that when in the meantime other hazardpointers are released, we might not free all resources we could
-        //(they will be freed in the next scan)
-        //also note that we never free something that is in use (and have no double free)
         for (auto p : deleteSet)
         {
-
-            //just to understand the cause of the free bug
-            auto hp = hazardPointers.load();
-            while (hp)
-            {
-                if (p == hp->ptr.load())
-                {
-                    hp->ptr.store(nullptr); //should not be necessary...
-                    hp->status.store(FREE);
-                }
-                hp = hp->next;
-            }
-
             free(p);
         }
 
