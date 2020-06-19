@@ -44,7 +44,17 @@ public:
         auto p = new T(std::forward<Args>(args)...);
         //std::cout << "allocated " << sizeof(T) << " bytes at " << p << std::endl;
         std::lock_guard<std::mutex> g(s_mutex);
-        s_allocations[p] = sizeof(T);
+
+        auto iter = s_allocations.find(p);
+
+        if (iter == s_allocations.end())
+        {
+            s_allocations[p] = 1;
+        }
+        else
+        {
+            iter->second++;
+        }
         s_numAllocations++;
         return p;
     }
@@ -57,21 +67,34 @@ public:
         auto iter = s_allocations.find(p);
         if (iter != s_allocations.end())
         {
-            delete p;
+            if (iter->second >= 1)
+            {
+                delete p;
+                //std::cout << "deallocated " << sizeof(T) << " bytes at " << p << std::endl;
+                iter->second--;
+                s_numAllocations--;
 
-            //very subtle race, if this is missing, we get double free errors...
-            //std::cout << "deallocated " << sizeof(T) << " bytes at " << p << std::endl;
-            s_allocations.erase(iter);
-            s_numAllocations--;
+                if (iter->second > 0)
+                {
+                    std::cout << "free error: " << p << " missing deallocation" << std::endl;
+                    s_errors++;
+                }
+            }
+            else if (iter->second == 0)
+            {
+                std::cout << "free error: " << p << " not allocated or double free" << std::endl;
+                s_errors++;
+            }
         }
         else
         {
-            std::cout << "free error: " << p << " not allocated or double free" << std::endl;
+            std::cout << "free error: " << p << " not allocated" << std::endl;
             s_errors++;
         }
     }
 
-    static void print()
+    static void
+    print()
     {
         std::lock_guard<std::mutex> g(s_mutex);
         std::cout << "MonitoredAllocator free errors " << s_errors << std::endl;
@@ -88,13 +111,13 @@ public:
     }
 
     static std::mutex s_mutex; //todo: only for testing, must be removed together with the map to make it lock_free
-    static std::map<void *, size_t> s_allocations;
+    static std::map<void *, uint64_t> s_allocations;
     static uint64_t s_numAllocations;
     static size_t s_errors;
 };
 
 std::mutex MonitoredAllocator::s_mutex;
-std::map<void *, size_t> MonitoredAllocator::s_allocations{};
+std::map<void *, uint64_t> MonitoredAllocator::s_allocations{};
 uint64_t MonitoredAllocator::s_numAllocations{0};
 size_t MonitoredAllocator::s_errors{0};
 

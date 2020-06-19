@@ -63,6 +63,19 @@ private:
             return "";
         }
 
+        bool updateStatus(uint32_t expected, uint32_t desired)
+        {
+            uint32_t oldStatus = expected;
+            do
+            {
+                if (status.compare_exchange_weak(oldStatus, desired))
+                {
+                    return true;
+                }
+            } while (oldStatus == expected);
+            return false;
+        }
+
         std::atomic<T *> ptr{nullptr}; //the payload we want to protect todo: can be mase nonatomic in conjunctio with atomic status?
         HazardPointer *next{nullptr};
         std::atomic<uint32_t> status{FREE};
@@ -95,7 +108,7 @@ public:
         ReadOnlyProxy(LockFree<S> &wrapper) : wrapper(&wrapper)
         {
             hp = this->wrapper->acquireHazardPointer(); //todo: deal with failure (hard to do, we need the raw pointer in operator->)
-            object = this->wrapper->ptr(*hp);
+            object = hp->ptr.load();
         }
 
         //ReadOnlyProxy(const ReadOnlyProxy &) = default;
@@ -131,7 +144,7 @@ public:
         TryWriteProxy(LockFree<S> &wrapper) : wrapper(&wrapper)
         {
             hp = this->wrapper->acquireHazardPointer(); //todo: deal with failure
-            object = this->wrapper->ptr(*hp);
+            object = hp->ptr.load();
             copy = this->wrapper->allocate(*object);
         }
 
@@ -279,11 +292,8 @@ private:
     std::atomic_bool canCreateHazardPointer{true};
     HazardPointer *currentObjectHazardPointer;
 
-    //for now, only one deleteScan shall be active at a time
-    std::atomic_flag scanInProgress{false};
-
     //hazardpointers are only created and not destroyed until the LockFree object goes out of scope
-    //(to make dealing with some ABA issues easy)
+    //(to make dealing with some ABA issues easier)
     //the list only grows if new hazard pointers are needed, this avoids ABA problems but leads to inefficiencies
     //this is also not the best structure to search in, there is potential for optimization
     //but it shows the general idea
@@ -292,12 +302,6 @@ private:
     std::atomic<uint64_t> numUsedHazardPointers{1};
     std::atomic<uint64_t> numReleasedHazardPointers{0};
     std::atomic<HazardPointer *> hazardPointers{nullptr}; //managed hazard pointers, can be used to protect objects
-
-    //todo: uneeded, remove later
-    T *ptr(HazardPointer &hp)
-    {
-        return hp.ptr.load();
-    }
 
     //get a free hazard pointer or create a new one
     HazardPointer *acquireHazardPointer()
@@ -320,7 +324,7 @@ private:
                     do
                     {
                         hp->ptr.store(ptr);
-                        //is it still the same?
+                        //is it still the same? needed, to ensure the hazard pointer is protected and no deletion in progress (when current object changes)
                         if (currentObjectHazardPointer->ptr.compare_exchange_strong(ptr, ptr))
                         {
                             break;
@@ -348,7 +352,7 @@ private:
                 do
                 {
                     hp->ptr.store(ptr);
-                    //is it still the same?
+                    //is it still the same? needed, to ensure the hazard pointer is protected and no deletion in progress (when current object changes)
                     if (currentObjectHazardPointer->ptr.compare_exchange_strong(ptr, ptr))
                     {
                         break;
@@ -383,22 +387,9 @@ private:
         }
     }
 
-    bool deleteScan()
+    //todo: can this be done in a less complicated/inefficient way without compromising lockfree robustness?
+    void deleteScan()
     {
-        if (scanInProgress.test_and_set(std::memory_order_acq_rel))
-        {
-            //todo: we are not fully able to leave this out, there is some deletion race...why?
-            //return false; //another scan is in progress, we skip the scan
-        }
-
-        //printHazards();
-
-        //todo: we are lockfree, but the problem is: if the scanning thread dies, no one can ever scan again
-        //and we leak memory (and probably fast) sinc eno hazard pointer will be freed
-        //however, to scans in parallel will interfere in a bad way: potentially trying to delete the same pointers
-        //so this must be prevented
-        //major todo/question: can we do it in a robust lockfree way (without the scanInProgress flag)
-
         std::list<HazardPointer *> deleteCandidates;
         std::set<T *> usedPointers;
 
@@ -408,8 +399,9 @@ private:
             auto hp = hazardPointers.load();
             while (hp)
             {
-                auto status = hp->status.load();
-                if (status == RELEASED || status == DELETABLE /*|| status == READY_TO_DELETE*/)
+                uint32_t status = hp->status.load(); //this can be outdated but it does not matter
+
+                if (status == RELEASED || status == DELETABLE)
                 {
                     deleteCandidates.push_back(hp);
                 }
@@ -419,7 +411,7 @@ private:
                 }
                 // else if (status == DELETED)
                 // {
-                //     hp->status.store(FREE);
+                //     hp->status.store(FREE); //can only be done by deleting thread (can we improve this?)
                 // }
                 hp = hp->next;
             }
@@ -431,36 +423,20 @@ private:
         for (auto hp : deleteCandidates)
         {
             auto ptr = hp->ptr.load();
-            if (hp->status.load() == RELEASED)
+            if (usedPointers.find(ptr) == usedPointers.end())
             {
-                if (usedPointers.find(ptr) == usedPointers.end())
+                if (hp->updateStatus(RELEASED, DELETABLE))
                 {
-                    hp->status.store(DELETABLE);
+                    deletableHazardPointers.push_back(hp);
+                }
+                else
+                {
                     deletableHazardPointers.push_back(hp);
                 }
             }
-            else
-            {
-                //READY_TO_DELETE or DELETABLE
-                deletableHazardPointers.push_back(hp);
-            }
         }
 
-        //now the following holds: for any pointer ptr that is deletable there is a collection of hazard pointers
-        //which hold it, there also is a first in list holding ptr, call that hp0
-        //it cannot be that new hazardpointers with ptr are added in front of hp0, because ptr cannot be the current object(its hazardpointer is always used)
-        //and ptr cannot be recycled by the allocator before it is deleted
-
-        //therefore: all threads see the same hp0 for ptr and leave it but set all others to FREEs
-        //afterwards another pass trys a compare exchange on the DELETABLE ones (the hp0s),
-        //only the winner actually deletes the pointer, avoiding multiple deletion and leaks
-
-        //todo: can this be done in a less complicated/inefficient way without compromising lockfree robustness?
-
-        //printHazards();
-
         std::set<T *> deleteSet;
-        std::list<HazardPointer *> deleteList;
         for (auto hp : deletableHazardPointers)
         {
             auto ptr = hp->ptr.load();
@@ -468,20 +444,18 @@ private:
             {
                 //first occurence, delete later
                 deleteSet.insert(ptr);
-                hp->status.store(READY_TO_DELETE);
-                deleteList.push_back(hp);
+                hp->updateStatus(DELETABLE, READY_TO_DELETE);
             }
             else
             {
                 //further occurences, can be marked as free
-                //hp->ptr.store(nullptr); //should not be required
-                hp->status.store(FREE);
+                hp->updateStatus(DELETABLE, FREE); //can we just use a store?
             }
         }
 
-        //printHazards();
-
-        for (auto hp : deleteList)
+        //we also try to delete those others marked as ready to delete
+        auto hp = hazardPointers.load();
+        while (hp)
         {
             uint32_t expected = READY_TO_DELETE;
             do
@@ -495,21 +469,19 @@ private:
                     {
                         if (hp->ptr.compare_exchange_strong(ptr, nullptr))
                         {
-                            hp->status.store(FREE);
+                            //hp->ptr.store(nullptr);
+
                             deallocate(ptr); //only one thread can win and delete the pointer
+                            hp->status.store(FREE);
                             break;
                         }
                     }
                     break;
                 }
             } while (expected == READY_TO_DELETE); //if not, someone else deleted, ok
+
+            hp = hp->next;
         }
-
-        // std::cout << "scan complete" << std::endl;
-        // printHazards();
-
-        scanInProgress.clear(std::memory_order_acq_rel);
-        return true;
     }
 
     template <typename... Args>
