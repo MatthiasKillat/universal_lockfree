@@ -20,18 +20,20 @@
 //todo: optimization
 //todo: transaction proxy (similar to writer, but with explicit writeback)
 
+//using Allocator = DefaultAllocator;
+using Allocator = MonitoredAllocator;
+
 template <typename T>
 class LockFree
 {
 private:
     enum Status
     {
-        FREE,
-        USED,
-        RELEASED,
-        DELETABLE,
-        READY_TO_DELETE,
-        DELETED
+        FREE,             //the hazard pointer can be acquired and its pointer set
+        USED,             //the hazard pointer is in use and protecting what ptr points to
+        RELEASED,         //the hazard pointer was released but its protected ptr not cleaned up (which might not be possible if there are other users)
+        DELETE_CANDIDATE, //the hazard pointer was released and one instance of its protected ptr can be deleted
+        READY_TO_DELETE   //the hazard pointer was released and this specific ptr instance can be deleted
     };
 
     struct HazardPointer
@@ -55,10 +57,10 @@ private:
                 return "USED";
             case RELEASED:
                 return "RELEASED";
-            case DELETABLE:
-                return "DELETABLE";
-            case DELETED:
-                return "DELETED";
+            case DELETE_CANDIDATE:
+                return "DELETE_CANDIDATE";
+            case READY_TO_DELETE:
+                return "READY_TO_DELETE";
             }
             return "";
         }
@@ -79,6 +81,7 @@ private:
         std::atomic<T *> ptr{nullptr}; //the payload we want to protect todo: can be mase nonatomic in conjunctio with atomic status?
         HazardPointer *next{nullptr};
         std::atomic<uint32_t> status{FREE};
+        std::atomic_flag deletionInProgress{false};
         const uint64_t id; //unique and does not change (todo: not needed, can use the this pointer instead later)
     };
 
@@ -172,7 +175,11 @@ public:
         // (acquisition will happen much more often compared to creation)
         canCreateHazardPointer.store(false, std::memory_order_release);
 
+        std::cout << "final object " << currentObjectHazardPointer->ptr.load() << std::endl;
+
         auto hp = hazardPointers.load();
+
+        printHazards();
 
         while (hp)
         {
@@ -183,9 +190,11 @@ public:
             hp = hp->next;
         }
 
-        //major todo: we run into double frees here somehow
-        //should probably block acquisition here as well
-        releaseHazardPointer(*currentObjectHazardPointer); //triggers a scan and since all were RELEASED all get freed
+        printHazards();
+
+        deleteScan();
+
+        printHazards();
 
         hp = hazardPointers.load();
         while (hp)
@@ -218,22 +227,6 @@ public:
             return true;
         }
         releaseHazardPointer(*hp);
-        return false;
-    }
-
-    bool updateObject(T *expectedObject, T *newObject)
-    {
-        //auto hp = acquireHazardPointer();
-        //we cannot have an ABA problem here, ptr will be deleted and possibly recycled only after no one holds ptr anymore
-        //in a hazardpointer (and therefore will not try to update with this old value)
-        if (currentObjectHazardPointer->ptr.compare_exchange_strong(expectedObject, newObject))
-        {
-            //assert(hp->ptr.load() == expectedObject);
-
-            //releaseHazardPointer(*hp);
-            return true;
-        }
-        //releaseHazardPointer(*hp);
         return false;
     }
 
@@ -401,7 +394,7 @@ private:
             {
                 uint32_t status = hp->status.load(); //this can be outdated but it does not matter
 
-                if (status == RELEASED || status == DELETABLE)
+                if (status == RELEASED || status == DELETE_CANDIDATE)
                 {
                     deleteCandidates.push_back(hp);
                 }
@@ -409,10 +402,6 @@ private:
                 {
                     usedPointers.insert(hp->ptr.load());
                 }
-                // else if (status == DELETED)
-                // {
-                //     hp->status.store(FREE); //can only be done by deleting thread (can we improve this?)
-                // }
                 hp = hp->next;
             }
         }
@@ -425,7 +414,7 @@ private:
             auto ptr = hp->ptr.load();
             if (usedPointers.find(ptr) == usedPointers.end())
             {
-                if (hp->updateStatus(RELEASED, DELETABLE))
+                if (hp->updateStatus(RELEASED, DELETE_CANDIDATE))
                 {
                     deletableHazardPointers.push_back(hp);
                 }
@@ -443,42 +432,51 @@ private:
             if (deleteSet.find(ptr) == deleteSet.end())
             {
                 //first occurence, delete later
-                deleteSet.insert(ptr);
-                hp->updateStatus(DELETABLE, READY_TO_DELETE);
+                if (hp->updateStatus(DELETE_CANDIDATE, READY_TO_DELETE))
+                {
+                    deleteSet.insert(ptr);
+                }
             }
             else
             {
-                //further occurences, can be marked as free
-                hp->updateStatus(DELETABLE, FREE); //can we just use a store?
+                //further occurences, may be marked as free
+                hp->updateStatus(DELETE_CANDIDATE, FREE); //todo: can we just use a store?
             }
         }
 
-        //we also try to delete those others marked as ready to delete
+        tryDelete();
+    }
+
+    void tryDelete()
+    {
         auto hp = hazardPointers.load();
         while (hp)
         {
-            uint32_t expected = READY_TO_DELETE;
-            do
+            uint32_t status = hp->status.load();
+            while (status == READY_TO_DELETE)
             {
-                auto ptr = hp->ptr.load();
-                //cannot go to FREE directly, ptr may be used again before it is deleted (causing us to delete the wrong pointer)
-                if (hp->status.compare_exchange_strong(expected, DELETED))
+                //not ideal, we may leak this hp if the setting thread dies (todo: find a better solution)
+                if (hp->deletionInProgress.test_and_set())
                 {
-                    //if we stall here, there is a leak of the hazard pointer and its resource...hard to avoid
-                    while (ptr != nullptr)
-                    {
-                        if (hp->ptr.compare_exchange_strong(ptr, nullptr))
-                        {
-                            //hp->ptr.store(nullptr);
+                    break;
+                }
 
-                            deallocate(ptr); //only one thread can win and delete the pointer
-                            hp->status.store(FREE);
+                //exclusive access to this hp
+                //check whether it is still ready to delete
+                do
+                {
+                    if (hp->status.compare_exchange_strong(status, READY_TO_DELETE))
+                    {
+                        deallocate(hp->ptr.load());
+                        if (hp->updateStatus(READY_TO_DELETE, FREE))
+                        {
                             break;
                         }
                     }
-                    break;
-                }
-            } while (expected == READY_TO_DELETE); //if not, someone else deleted, ok
+                } while (status == READY_TO_DELETE);
+
+                hp->deletionInProgress.clear();
+            }
 
             hp = hp->next;
         }
@@ -509,6 +507,15 @@ private:
             return new HazardPointer(id);
         }
         return nullptr;
+    }
+
+    bool updateObject(T *expectedObject, T *newObject)
+    {
+        if (currentObjectHazardPointer->ptr.compare_exchange_strong(expectedObject, newObject))
+        {
+            return true;
+        }
+        return false;
     }
 
     void printHazards()

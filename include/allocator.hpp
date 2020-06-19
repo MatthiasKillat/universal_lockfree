@@ -99,10 +99,13 @@ public:
         std::lock_guard<std::mutex> g(s_mutex);
         std::cout << "MonitoredAllocator free errors " << s_errors << std::endl;
         std::cout << "MonitoredAllocator current allocations " << s_numAllocations << std::endl;
-        // for (auto &pair : s_allocations)
-        // {
-        //     std::cout << pair.first << " " << pair.second << "bytes" << std::endl;
-        // }
+        for (auto &pair : s_allocations)
+        {
+            if (pair.second > 0)
+            {
+                std::cout << pair.first << std::endl;
+            }
+        }
     }
 
     static size_t errors()
@@ -120,6 +123,3 @@ std::mutex MonitoredAllocator::s_mutex;
 std::map<void *, uint64_t> MonitoredAllocator::s_allocations{};
 uint64_t MonitoredAllocator::s_numAllocations{0};
 size_t MonitoredAllocator::s_errors{0};
-
-//using Allocator = DefaultAllocator;
-using Allocator = MonitoredAllocator;

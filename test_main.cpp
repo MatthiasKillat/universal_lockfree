@@ -79,7 +79,7 @@ int main(int argc, char **argv)
 
     {
         LockFree<Bar> lfBar;
-        testLockfree(lfBar, 1000, 3, 5);
+        testLockfree(lfBar, 10000, 3, 5);
         std::cout << "Lockfree Bar" << std::endl;
         lfBar->print();
     }
