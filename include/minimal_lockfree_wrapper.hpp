@@ -14,14 +14,7 @@
 
 #include "assert.h"
 
-//potentially useful for read often, write seldom lockfree structures
-//or prototyping where performance is not the primary issue (the internal copies are quite inefficient)
-
-//todo: generalize allocation, deal with failures/bounded resources
-//todo: memory order
-//todo: interface, proxy design, copy/move
-//todo: optimization
-//todo: transaction proxy (similar to writer, but with explicit writeback)
+//reduce the lockfree wrapper to a minimal set, to find reason for the deletion anomaly
 
 //using Allocator = DefaultAllocator;
 using Allocator = MonitoredAllocator;
@@ -91,86 +84,13 @@ private:
     };
 
 public:
-    //as long as this object lives, we have read access to the object state (which may be outdated, however)
-    //this means the object state is NOT deleted during the lifetime of the proxy
-    template <typename S>
-    class ReadOnlyProxy
-    {
-    public:
-        friend class LockFree<T>;
-        ~ReadOnlyProxy()
-        {
-            wrapper->releaseHazardPointer(*hp);
-        }
-
-        const S *operator->()
-        {
-            return object;
-        }
-
-    private:
-        HazardPointer *hp;
-        S *object;
-        LockFree<S> *wrapper;
-
-        ReadOnlyProxy(LockFree<S> &wrapper) : wrapper(&wrapper)
-        {
-            hp = this->wrapper->acquireHazardPointer(); //todo: deal with failure (hard to do, we need the raw pointer in operator->)
-            object = hp->ptr.load();
-        }
-
-        //ReadOnlyProxy(const ReadOnlyProxy &) = default;
-        //ReadOnlyProxy(ReadOnlyProxy &&) = default;
-    };
-
-    template <typename S>
-    class TryWriteProxy
-    {
-    public:
-        friend class LockFree<T>;
-        ~TryWriteProxy()
-        {
-            if (!wrapper->updateObject(object, copy))
-            {
-                wrapper->deallocate(copy);
-            }
-
-            wrapper->releaseHazardPointer(*hp);
-        }
-
-        S *operator->()
-        {
-            return copy;
-        }
-
-    private:
-        HazardPointer *hp;
-        S *object;
-        S *copy;
-        LockFree<S> *wrapper;
-
-        TryWriteProxy(LockFree<S> &wrapper) : wrapper(&wrapper)
-        {
-            hp = this->wrapper->acquireHazardPointer(); //todo: deal with failure
-            object = hp->ptr.load();
-            copy = this->wrapper->allocate(*object);
-        }
-
-        //TryWriteProxy(const TryWriteProxy &) = default;
-        //TryWriteProxy(TryWriteProxy &&) = default;
-    };
-
-public:
-    friend class ReadOnlyProxy<T>;
-    friend class TryWriteProxy<T>;
-
     template <typename... Args>
     LockFree(Args &&... args) : currentObjectHazardPointer(new HazardPointer(0))
     {
         auto initialObject = allocate(std::forward<Args>(args)...);
         currentObjectHazardPointer->ptr.store(initialObject); //owned internally, only released in dtor, prevents deletion of current object
         currentObjectHazardPointer->status.store(USED);
-        hazardPointers = new HazardPointer(0);
+        hazardPointers = currentObjectHazardPointer;
     }
 
     ~LockFree()
@@ -184,7 +104,7 @@ public:
 
         //std::this_thread::sleep_for(std::chrono::seconds(1));
 
-        printHazards();
+        //printHazards();
 
         while (hp)
         {
@@ -195,13 +115,11 @@ public:
             hp = hp->next;
         }
 
-        printHazards();
+        //printHazards();
 
         deleteScan();
 
-        printHazards();
-
-        deallocate(currentObjectHazardPointer->ptr.load());
+        //printHazards();
 
         hp = hazardPointers.load();
         while (hp)
@@ -215,65 +133,25 @@ public:
     LockFree(const LockFree &) = delete;
     LockFree(LockFree &&) = delete;
 
-    //************************************debug, control object state
-
-    T *currentObject()
+    T *operator->()
     {
-        return currentObjectHazardPointer->ptr.load();
-    }
-
-    bool updateObject(T *newObject)
-    {
-        auto hp = acquireHazardPointer(); //to protect the current object and be able to delete it later
-        T *expectedObject = hp->ptr.load();
-        //we cannot have an ABA problem here, ptr will be deleted and possibly recycled only after no one holds ptr anymore
-        //in a hazardpointer (and therefore will not try to update with this old value)
-        if (currentObjectHazardPointer->ptr.compare_exchange_strong(expectedObject, newObject))
-        {
-            releaseHazardPointer(*hp);
-            return true;
-        }
-        releaseHazardPointer(*hp);
-        return false;
-    }
-
-    //***********************proxy interface
-
-    ReadOnlyProxy<T> readOnly()
-    {
-        return ReadOnlyProxy<T>(*this);
-    }
-
-    TryWriteProxy<T> tryWrite()
-    {
-        return TryWriteProxy<T>(*this);
-    }
-
-    TryWriteProxy<T> operator->()
-    {
-        return tryWrite();
-    }
-
-    //todo: implement, communicate success/failure
-    template <typename Function, typename... Params>
-    decltype(auto) tryInvoke(Function &&f, Params &&... params)
-    {
+        return currentObject();
     }
 
     //todo: variant without return value, does not need to compute result internally
     template <typename Function, typename... Params>
     decltype(auto) invoke(Function &&f, Params &&... params)
     {
-
+        auto hp = acquireHazardPointer();
+        T *protectedObject = hp->ptr.load(); //supposed to point to current object, but can have changed concurrently (CAS will fail then)
         do
         {
-            auto hp = acquireHazardPointer();
-            T *expected = hp->ptr.load();
-            T *copy = allocate(*expected); //local copy, protected against deletion by hp
+            T *copy = allocate(*protectedObject); //local copy
 
             auto result = std::invoke(f, copy, std::forward<Params>(params)...);
 
-            if (currentObjectHazardPointer->ptr.compare_exchange_strong(expected, copy))
+            //in the successful case of the CAS: hp protected expected
+            if (currentObjectHazardPointer->ptr.compare_exchange_strong(protectedObject, copy))
             {
                 releaseHazardPointer(*hp);
                 return result;
@@ -281,13 +159,10 @@ public:
 
             //our update failed, the copy is useless now
             deallocate(copy); //could optimize and use in place construction in memory instead
-            releaseHazardPointer(*hp);
+            //releaseHazardPointer(*hp);
 
             //we recycle the hazard pointer and load the new object state
-            // do
-            // {
-            //     hp->ptr.store(currentObject());
-            // } while (hp->ptr.load() != currentObject());
+            protectedObject = protectCurrentObject(hp);
 
         } while (true);
     }
@@ -296,16 +171,26 @@ private:
     std::atomic_bool canCreateHazardPointer{true};
     HazardPointer *currentObjectHazardPointer;
 
-    //hazardpointers are only created and not destroyed until the LockFree object goes out of scope
-    //(to make dealing with some ABA issues easier)
-    //the list only grows if new hazard pointers are needed, this avoids ABA problems but leads to inefficiencies
-    //this is also not the best structure to search in, there is potential for optimization
-    //but it shows the general idea
-
-    std::atomic<uint64_t> numHazardPointers{1}; //i.e. list size
+    std::atomic<uint64_t> numHazardPointers{1};
     std::atomic<uint64_t> numUsedHazardPointers{1};
     std::atomic<uint64_t> numReleasedHazardPointers{0};
-    std::atomic<HazardPointer *> hazardPointers{nullptr}; //managed hazard pointers, can be used to protect objects
+    std::atomic<HazardPointer *> hazardPointers{nullptr};
+
+    T *currentObject()
+    {
+        return currentObjectHazardPointer->ptr.load();
+    }
+
+    T *protectCurrentObject(HazardPointer *hp)
+    {
+        T *ptr;
+        do
+        {
+            ptr = currentObject();
+            hp->ptr.store(ptr);
+        } while (hp->ptr.load() != currentObject()); //need to check
+        return ptr;
+    }
 
     //get a free hazard pointer or create a new one
     HazardPointer *acquireHazardPointer()
@@ -323,17 +208,7 @@ private:
                 uint32_t expectedStatus = FREE;
                 if (hp->status.compare_exchange_strong(expectedStatus, USED))
                 {
-                    auto ptr = currentObjectHazardPointer->ptr.load();
-                    do
-                    {
-                        hp->ptr.store(ptr);
-                        //is it still the same? needed, to ensure the hazard pointer is protected and no deletion in progress (when current object changes)
-                        if (currentObjectHazardPointer->ptr.compare_exchange_strong(ptr, ptr))
-                        {
-                            break;
-                        }
-                    } while (true);
-
+                    protectCurrentObject(hp);
                     numUsedHazardPointers.fetch_add(1);
                     return hp;
                 }
@@ -351,16 +226,7 @@ private:
             hp->next = head;
             if (hazardPointers.compare_exchange_weak(head, hp))
             {
-                auto ptr = currentObjectHazardPointer->ptr.load();
-                do
-                {
-                    hp->ptr.store(ptr);
-                    //is it still the same? needed, to ensure the hazard pointer is protected and no deletion in progress (when current object changes)
-                    if (currentObjectHazardPointer->ptr.compare_exchange_strong(ptr, ptr))
-                    {
-                        break;
-                    }
-                } while (true);
+                protectCurrentObject(hp);
                 break;
             }
 
@@ -370,30 +236,28 @@ private:
         return hp;
     }
 
-    //expect that it is a used hazard pointer
-    void
-    releaseHazardPointer(HazardPointer &hp)
+    void releaseHazardPointer(HazardPointer &hp)
     {
-        //we are the only writer to this hazard pointer (hence no compare exchange needed)
-        hp.status.store(RELEASED);
-        auto numReleased = numReleasedHazardPointers.fetch_add(1, std::memory_order_relaxed);
-        auto numUsed = numUsedHazardPointers.fetch_sub(1, std::memory_order_relaxed);
-
-        constexpr double deleteScanFactor = 0.3;
-        if (numUsed * deleteScanFactor <= numReleased)
+        if (hp.updateStatus(USED, RELEASED))
         {
-            //when enough were released (relative to those used) we atomically reset the released counter and trigger a scan
-            do
+            auto numReleased = numReleasedHazardPointers.fetch_add(1, std::memory_order_relaxed);
+            auto numUsed = numUsedHazardPointers.fetch_sub(1, std::memory_order_relaxed);
+
+            constexpr double deleteScanFactor = 0.3;
+            if (numUsed * deleteScanFactor <= numReleased)
             {
-            } while (!numReleasedHazardPointers.compare_exchange_weak(numReleased, 0));
-            deleteScan();
+                //when enough were released (relative to those used) we atomically reset the released counter and trigger a scan
+                do
+                {
+                } while (!numReleasedHazardPointers.compare_exchange_weak(numReleased, 0));
+                deleteScan();
+            }
         }
     }
 
-    //todo: can this be done in a less complicated/inefficient way without compromising lockfree robustness?
     void deleteScan()
     {
-        deleteMutex.lock();
+        //deleteMutex.lock();
         std::list<HazardPointer *> deleteCandidates;
         std::set<T *> usedPointers;
 
@@ -448,13 +312,13 @@ private:
                 hp->updateStatus(DELETE_CANDIDATE, FREE); //todo: can we just use a store?
             }
         }
-        deleteMutex.unlock();
+        //deleteMutex.unlock();
 
         tryDelete();
     }
 
-    std::mutex deleteMutex; //for testing
-#if 0
+    //std::mutex deleteMutex; //for testing
+#if 1
     void tryDelete()
     {
         //deleteMutex.lock();
@@ -462,15 +326,15 @@ private:
         while (hp)
         {
 
-            hp->mutex.lock();
+            //hp->mutex.lock();
             uint32_t status = hp->status.load();
             while (status == READY_TO_DELETE)
             {
                 //not ideal, we may leak this hp if the setting thread dies (todo: find a better solution)
-                // if (hp->deletionInProgress.test_and_set())
-                // {
-                //     break;
-                // }
+                if (hp->deletionInProgress.test_and_set())
+                {
+                    break;
+                }
 
                 //exclusive access to this hp
                 //check whether it is still ready to delete
@@ -479,14 +343,15 @@ private:
                     if (hp->status.compare_exchange_strong(status, READY_TO_DELETE))
                     {
                         deallocate(hp->ptr.load());
+                        hp->ptr.store(nullptr);
                         hp->updateStatus(READY_TO_DELETE, FREE);
                         break;
                     }
                 } while (status == READY_TO_DELETE);
 
-                // hp->deletionInProgress.clear();
+                hp->deletionInProgress.clear();
             }
-            hp->mutex.unlock();
+            //hp->mutex.unlock();
 
             hp = hp->next;
         }
@@ -542,17 +407,6 @@ private:
             return new HazardPointer(id);
         }
         return nullptr;
-    }
-
-    //todo: take a look at invoke and make sure it works similarly with the trywriter (there are subtle races when recycling hps)
-    bool updateObject(T *expectedObject, T *newObject)
-    {
-
-        if (currentObjectHazardPointer->ptr.compare_exchange_strong(expectedObject, newObject))
-        {
-            return true;
-        }
-        return false;
     }
 
     void printHazards()

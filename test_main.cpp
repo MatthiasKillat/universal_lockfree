@@ -2,7 +2,7 @@
 #include <thread>
 #include <chrono>
 
-#include "lockfree_wrapper.hpp"
+#include "minimal_lockfree_wrapper.hpp"
 #include "allocator.hpp"
 #include "bar.hpp"
 
@@ -79,12 +79,11 @@ int main(int argc, char **argv)
 
     {
         LockFree<Bar> lfBar;
-        testLockfree(lfBar, 10000, 3, 5);
+        testLockfree(lfBar, 100000, 3, 5);
         std::cout << "Lockfree Bar" << std::endl;
         lfBar->print();
     }
 
-    //todo: there still is a race /missing deletion as the MonitoredAllocator shows
     Allocator::print();
     return 0;
 }
